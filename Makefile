@@ -26,4 +26,9 @@ install-omarchy:
 uninstall-omarchy:
 	rm -f "$(OMARCHY_PLUGIN_DIR)/mryll.meteobar"
 
-.PHONY: build install uninstall install-omarchy uninstall-omarchy
+# Unit-test the plugin's pure JS helpers. Needs node; the QML itself is
+# checked by loading it (`omarchy restart shell`).
+check-omarchy:
+	node --test omarchy/Geocode.test.mjs
+
+.PHONY: build install uninstall install-omarchy uninstall-omarchy check-omarchy

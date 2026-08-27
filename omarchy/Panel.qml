@@ -3,6 +3,7 @@ import QtQuick
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Geocode.js" as Geocode
 
 // Forecast panel. Owns the meteobar process and the refresh timer, so the bar
 // label stays current even while the panel is closed. All data comes from
@@ -18,6 +19,9 @@ Panel {
   // The bar tracks the widget mounted in its slot — BarWidget.qml — not this
   // nested panel, so popout coordination has to identify as that widget.
   property var hostWidget: null
+  // Injected by BarWidget.qml from bar.shell.pluginRegistry. Only the
+  // location editor needs it; the panel renders fine without it.
+  property var pluginRegistry: null
   readonly property var barIdentity: hostWidget || root
 
   // ---- theme handles (guarded: `bar` is injected after load) --------------
@@ -121,6 +125,7 @@ Panel {
   }
 
   function close() {
+    if (root.editingLocation) cancelEditingLocation()
     root.controller.hide()
   }
 
@@ -408,6 +413,129 @@ Panel {
     }
   }
 
+  // ---- In-panel location editing -------------------------------------------
+  // The hero's location line and the `l` key both open an editor below the
+  // hero. Typing runs a debounced Open-Meteo geocoding lookup — the same
+  // endpoint and the same shape the first-party weather panel used — and
+  // Geocode.js turns the reply into rows.
+  //
+  // Committing writes the `location` setting through the shell's plugin
+  // registry, which lands in the widget's entry in shell.json: the same place
+  // the settings UI writes, so there is one source of truth and no second
+  // state file. Nothing here triggers a fetch, because nothing needs to —
+  // `fetchKey` above already depends on locationSetting, so the write comes
+  // back as a settings change and the existing refresh path runs.
+  property bool editingLocation: false
+  property var locationSuggestions: []
+  property int suggestionIndex: 0
+  property string locationSaveError: ""
+  property string geocodePendingQuery: ""
+  property string geocodeActiveQuery: ""
+
+  readonly property bool canEditLocation: !!(pluginRegistry && pluginRegistry.setBarWidget)
+
+  function startEditingLocation() {
+    locationSaveError = ""
+    locationSuggestions = []
+    suggestionIndex = 0
+    geocodePendingQuery = ""
+    locationField.text = locationSetting
+    editingLocation = true
+    // The field has to exist before it can take focus, and `visible` only
+    // settles once this binding has propagated.
+    Qt.callLater(function() {
+      locationField.forceActiveFocus()
+      locationField.selectAll()
+    })
+  }
+
+  function cancelEditingLocation() {
+    editingLocation = false
+    locationSuggestions = []
+    suggestionIndex = 0
+    geocodePendingQuery = ""
+    locationSaveError = ""
+    geocodeDebounce.stop()
+  }
+
+  function clearLocation() {
+    locationField.text = ""
+    commitLocation()
+  }
+
+  function commitLocation() {
+    var value = Geocode.commitValue(locationField.text, locationSuggestions, suggestionIndex)
+    if (value === locationSetting) {
+      cancelEditingLocation()
+      return
+    }
+    if (!canEditLocation) {
+      // Left open on purpose: the typed text survives so it can be copied
+      // somewhere that does work.
+      locationSaveError = "the shell did not hand this panel its plugin registry"
+      return
+    }
+    var err = String(pluginRegistry.setBarWidget(root.moduleName, "location", value, {}) || "")
+    if (err !== "") {
+      locationSaveError = err
+      return
+    }
+    cancelEditingLocation()
+  }
+
+  function requestGeocode() {
+    var query = String(locationField.text).trim()
+    // One character matches most of the planet; the reply would be noise.
+    if (query.length < 2) {
+      locationSuggestions = []
+      geocodePendingQuery = ""
+      return
+    }
+    geocodePendingQuery = query
+    // Only ever one lookup in flight, so replies cannot arrive out of order.
+    // A keystroke during one just waits for the next tick of the debounce.
+    if (geocodeProc.running) {
+      geocodeDebounce.restart()
+      return
+    }
+    startGeocode()
+  }
+
+  function startGeocode() {
+    geocodeActiveQuery = geocodePendingQuery
+    geocodeProc.command = ["curl", "-fsS", "--max-time", "5",
+      "https://geocoding-api.open-meteo.com/v1/search?name="
+        + encodeURIComponent(geocodeActiveQuery) + "&count=5&language=en&format=json"]
+    geocodeProc.running = true
+  }
+
+  Timer {
+    id: geocodeDebounce
+    interval: 250
+    repeat: false
+    onTriggered: root.requestGeocode()
+  }
+
+  Process {
+    id: geocodeProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // A reply that outlived the editor is dropped rather than cached: the
+        // next open starts from whatever is in settings then.
+        if (!root.editingLocation) {
+          root.locationSuggestions = []
+          return
+        }
+        // Parsing never throws and never returns junk — an unreachable network
+        // and a malformed body both arrive here as an empty list, which reads
+        // as "no matches" and leaves Enter free to save the typed text.
+        root.locationSuggestions = Geocode.parseSuggestions(text)
+        root.suggestionIndex = 0
+      }
+    }
+  }
+
   Timer {
     interval: root.refreshMinutes * 60 * 1000
     running: true
@@ -429,9 +557,15 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // PanelKeyCatcher takes keys before descendants, so an inline editor
+      // only receives Esc and the arrows once this is set.
+      blocked: root.editingLocation
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r") root.refresh() }
+      onTextKey: function(t) {
+        if (t === "r") root.refresh()
+        else if (t === "l") root.startEditingLocation()
+      }
 
       Flickable {
         id: contentScroll
@@ -521,6 +655,25 @@ Panel {
                 anchors.right: parent.right
                 height: Math.max(locationMark.implicitHeight, locationText.implicitHeight)
                 visible: root.locationName !== ""
+
+                // Clicking the resolved location opens the editor below.
+                Rectangle {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(3)
+                  radius: Math.min(4, Style.cornerRadius)
+                  color: locationEditArea.containsMouse
+                    ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+                }
+
+                MouseArea {
+                  id: locationEditArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(3)
+                  z: 1
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.startEditingLocation()
+                }
 
                 Text {
                   textFormat: Text.PlainText
@@ -629,6 +782,133 @@ Panel {
                   }
                 }
               }
+            }
+          }
+
+          // ---- Location editor. Full panel width for two reasons: a geocoding
+          //      label ("Toledo, Castille-La Mancha, ES") does not fit the
+          //      hero's right-hand column, and this has to stay reachable
+          //      when there is no forecast on screen to click — the hero is
+          //      hidden until data arrives, this is not.
+          Column {
+            id: locationEditor
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.editingLocation
+
+            Item {
+              width: parent.width
+              height: locationField.implicitHeight
+
+              TextField {
+                id: locationField
+                anchors.left: parent.left
+                anchors.right: locationClear.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.fg
+                font.family: root.fontFam
+                font.pixelSize: Style.font.bodySmall
+                placeholderText: "City, or \"City, CC\" — empty auto-detects"
+                onTextEdited: if (root.editingLocation) geocodeDebounce.restart()
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Escape) {
+                    root.cancelEditingLocation()
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    root.commitLocation()
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Down) {
+                    root.suggestionIndex =
+                      Geocode.clampIndex(root.suggestionIndex + 1, root.locationSuggestions.length)
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Up) {
+                    root.suggestionIndex =
+                      Geocode.clampIndex(root.suggestionIndex - 1, root.locationSuggestions.length)
+                    event.accepted = true
+                  }
+                }
+              }
+
+              // Clears the setting, which is what asks for IP auto-detect.
+              Text {
+                id: locationClear
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "\u2715"
+                color: locationClearArea.containsMouse ? root.fg : Qt.darker(root.fg, 1.55)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.bodySmall
+
+                MouseArea {
+                  id: locationClearArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.clearLocation()
+                }
+              }
+            }
+
+            Repeater {
+              model: root.editingLocation ? root.locationSuggestions : []
+
+              delegate: Rectangle {
+                required property var modelData
+                required property int index
+
+                width: locationEditor.width
+                height: suggestionLabel.implicitHeight + Style.space(8)
+                radius: Math.min(4, Style.cornerRadius)
+                color: index === root.suggestionIndex
+                  ? Style.selectionFillFor(root.fg, Color.accent)
+                  : (suggestionArea.containsMouse
+                      ? Style.hoverFillFor(root.fg, Color.accent) : "transparent")
+
+                Text {
+                  id: suggestionLabel
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(8)
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: String(modelData.label)
+                  elide: Text.ElideRight
+                  color: root.fg
+                  font.family: root.fontFam
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                MouseArea {
+                  id: suggestionArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.suggestionIndex = index
+                    root.commitLocation()
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              text: root.locationSaveError !== ""
+                ? "Could not save: " + root.locationSaveError
+                : (root.locationSuggestions.length > 0
+                    ? "\u2191/\u2193 pick \u00b7 Enter save \u00b7 Esc cancel"
+                    : "Enter saves what you typed \u00b7 Esc cancels")
+              color: root.locationSaveError !== ""
+                ? (root.panelColored ? root.urgentColor : root.fg)
+                : Qt.darker(root.fg, 1.55)
+              font.family: root.fontFam
+              font.pixelSize: Style.font.caption
             }
           }
 

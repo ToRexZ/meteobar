@@ -227,6 +227,12 @@ The repository is also an [Omarchy](https://omarchy.org) shell plugin. The bar s
   <img src="screenshots/omarchy-panel.png" alt="The meteobar panel: the current conditions and the forecast" width="380">
 </p>
 
+The location line in the hero is also the editor. Click it — or press `l`
+while the panel has focus — and a field opens under the hero. Typing looks the
+city up as you go and lists the matches; `↑`/`↓` pick one, `Enter` saves it, `Esc`
+abandons the edit, and the `✕` beside the field clears the setting back to IP
+auto-detect. See [Setting the location from the panel](#setting-the-location-from-the-panel).
+
 The panel shows more than the tooltip can:
 
 - A hero block with a large glyph, the temperature, the apparent temperature, and the resolved location
@@ -261,6 +267,7 @@ For development, link the working copy instead of cloning a second one:
 ```bash
 make install PREFIX=~/.local   # the meteobar binary must be on your PATH
 make install-omarchy           # links the repository into ~/.config/omarchy/plugins/
+make check-omarchy             # unit-tests omarchy/Geocode.js
 ```
 
 Then add the widget to the bar layout in `~/.config/omarchy/shell.json`:
@@ -282,6 +289,34 @@ To remove the link: `make uninstall-omarchy`.
 > [!IMPORTANT]
 > The shell compiles QML when it starts. After you edit a file in `omarchy/`, run `omarchy restart shell` to see the result. A plugin rescan is not sufficient.
 
+### Setting the location from the panel
+
+The `location` setting can be edited without leaving the panel:
+
+| Key or click | What it does |
+|---|---|
+| Click the location line, or `l` | Opens the field, prefilled with the current setting |
+| *type* | Looks the name up against Open-Meteo geocoding, debounced, and lists up to five matches |
+| `↑` / `↓` | Moves through the matches |
+| `Enter` | Saves the highlighted match — or the text as typed, when there are no matches |
+| `Esc` | Abandons the edit and changes nothing |
+| `✕` | Clears the setting, which is what asks for IP auto-detect |
+
+What gets saved is a name and not coordinates: the binary re-resolves it with its
+own geocoding, so the panel and the Waybar module agree on one setting. The
+compact `"City, CC"` form is used where it names exactly one city, and the
+province (`"Viborg, Central Jutland"`) where it does not — Open-Meteo returns two
+Springfields in the US, and `"Springfield, US"` would be a coin flip.
+
+Saving writes the widget's entry in `shell.json` through the shell's plugin
+registry, the same path the settings UI takes. There is no second state file, and
+the refetch needs no extra machinery: the panel already refetches when its
+settings change.
+
+With no matches on screen — geocoding unreachable, or a name it does not know —
+`Enter` still saves what you typed, so the documented `"City, CC"` form can be
+entered directly.
+
 ### Settings
 
 Configure these keys in the shell settings window, or in the layout entry in `shell.json`:
@@ -290,7 +325,7 @@ Configure these keys in the shell settings window, or in the layout entry in `sh
 |---|---|---|---|
 | `refreshMinutes` | 1-180 | `15` | Minutes between refreshes |
 | `units` | `metric`, `imperial` | `metric` | Unit system |
-| `location` | text | `""` | City name, `City, Province`, or `City, CC`. An empty value detects the location by IP |
+| `location` | text | `""` | City name, `City, Province`, or `City, CC`. An empty value detects the location by IP. Editable from the panel — see above |
 | `iconSet` | `nerd`, `weather`, `emoji`, `fontawesome` | `nerd` | Icon set. `fontawesome` needs otf-font-awesome 7 or later |
 | `colorMode` | `full`, `none`, `bar-only`, `panel-only` | `full` | Where to keep the colors |
 

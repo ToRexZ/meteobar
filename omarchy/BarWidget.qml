@@ -15,6 +15,10 @@ BarWidget {
     if ("settings" in target) target.settings = root.settings
     if ("anchorItem" in target) target.anchorItem = button
     if ("hostWidget" in target) target.hostWidget = root
+    // The shell owns this registry; the panel writes the location setting
+    // through it. Same route the plugin control center takes.
+    if ("pluginRegistry" in target)
+      target.pluginRegistry = (root.bar && root.bar.shell) ? root.bar.shell.pluginRegistry : null
   }
 
   function refresh() {
