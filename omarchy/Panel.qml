@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Geocode.js" as Geocode
+import "Favourites.js" as Favourites
 
 // Forecast panel. Owns the meteobar process and the refresh timer, so the bar
 // label stays current even while the panel is closed. All data comes from
@@ -93,6 +94,9 @@ Panel {
   readonly property int refreshMinutes: Math.max(1, parseInt(setting("refreshMinutes", 15), 10) || 15)
   readonly property string unitsSetting: String(setting("units", "metric")) === "imperial" ? "imperial" : "metric"
   readonly property string locationSetting: String(setting("location", "")).trim()
+  // Saved cities, in the same form as `location` — switching to one just
+  // writes it there. Normalized because shell.json is hand-editable.
+  readonly property var favourites: Favourites.normalize(setting("favourites", []))
   readonly property string iconSetSetting: {
     var v = String(setting("iconSet", "nerd"))
     return ["nerd", "weather", "emoji", "fontawesome"].indexOf(v) >= 0 ? v : "nerd"
@@ -413,6 +417,61 @@ Panel {
     }
   }
 
+
+  // ---- Favourites ----------------------------------------------------------
+  // A favourite is a shortcut and not a second notion of "where": switching
+  // writes `location`, so the bar, the panel and the Waybar module cannot
+  // disagree. The list itself lives beside it in the same shell.json entry.
+
+  function switchToFavourite(value) {
+    var target = String(value).trim()
+    if (target === "" || target === locationSetting) return
+
+    locationSaveError = ""
+    if (!canEditLocation) {
+      locationSaveError = "the shell did not hand this panel its plugin registry"
+      return
+    }
+    var err = String(pluginRegistry.setBarWidget(root.moduleName, "location", target, {}) || "")
+    if (err !== "") locationSaveError = err
+  }
+
+  // What the star acts on: what the editor would save right now, falling back to
+  // the current setting when the field is empty. Starring with a suggestion
+  // highlighted therefore saves the resolved "Bergen, NO", not a half-typed
+  // "Berg". Reads locationField only while editing, so the binding does not
+  // depend on it before it exists.
+  readonly property string favouriteCandidate: {
+    if (!editingLocation) return locationSetting
+    var typed = Geocode.commitValue(locationField.text, locationSuggestions, suggestionIndex)
+    return typed !== "" ? typed : locationSetting
+  }
+
+  function persistFavourites(list) {
+    if (!canEditLocation) {
+      locationSaveError = "the shell did not hand this panel its plugin registry"
+      return
+    }
+    locationSaveError = String(pluginRegistry.setBarWidget(root.moduleName, "favourites", list, {}) || "")
+  }
+
+  function toggleFavourite() {
+    var result = Favourites.toggle(favourites, favouriteCandidate)
+    // A refusal carries its own reason — the cap, or nothing to save — and the
+    // hint line under the editor is where the user is already looking.
+    if (!result.changed) {
+      locationSaveError = result.reason
+      return
+    }
+    persistFavourites(result.list)
+  }
+
+  function removeFavourite(value) {
+    var result = Favourites.toggle(favourites, value)
+    if (result.action !== "removed") return
+    persistFavourites(result.list)
+  }
+
   // ---- In-panel location editing -------------------------------------------
   // The hero's location line and the `l` key both open an editor below the
   // hero. Typing runs a debounced Open-Meteo geocoding lookup — the same
@@ -565,6 +624,10 @@ Panel {
       onTextKey: function(t) {
         if (t === "r") root.refresh()
         else if (t === "l") root.startEditingLocation()
+        else if (t >= "1" && t <= "9") {
+          var i = parseInt(t, 10) - 1
+          if (i < root.favourites.length) root.switchToFavourite(root.favourites[i])
+        }
       }
 
       Flickable {
@@ -785,6 +848,105 @@ Panel {
             }
           }
 
+          // ---- Favourites strip. Outside the editor on purpose: one click has
+          //      to switch, or a favourite is no faster than typing. Hidden
+          //      entirely while the list is empty rather than reserving space
+          //      to say nothing. Wraps, because eight chips do not fit a row.
+          Column {
+            id: favouritesStrip
+            width: parent.width
+            spacing: Style.space(4)
+            visible: root.favourites.length > 0
+              || (root.locationSaveError !== "" && !root.editingLocation)
+
+            Flow {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.favourites
+
+                delegate: Rectangle {
+                  required property var modelData
+                  required property int index
+
+                  readonly property bool isCurrent: String(modelData) === root.locationSetting
+
+                  width: chipRow.implicitWidth + Style.space(14)
+                  height: chipRow.implicitHeight + Style.space(7)
+                  radius: Math.min(4, Style.cornerRadius)
+                  color: isCurrent
+                    ? Style.selectionFillFor(root.fg, Color.accent)
+                    : (chipArea.containsMouse
+                        ? Style.hoverFillFor(root.fg, Color.accent) : "transparent")
+                  border.width: 1
+                  border.color: isCurrent ? Qt.darker(root.fg, 1.4) : Qt.darker(root.fg, 2.3)
+
+                  // Declared before the row so the row's own remove target,
+                  // being the later sibling, takes its clicks first.
+                  MouseArea {
+                    id: chipArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.switchToFavourite(modelData)
+                  }
+
+                  Row {
+                    id: chipRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(5)
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      // The qualifier is for the binary, not the reader; four
+                      // chips of "Viborg, DK" would not fit the panel.
+                      text: Favourites.chipLabel(modelData)
+                      color: root.fg
+                      font.family: root.fontFam
+                      font.pixelSize: Style.font.bodySmall
+                    }
+
+                    // Removal appears only while editing: a stray click on a
+                    // switcher must not delete the thing it switches to.
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: root.editingLocation
+                      textFormat: Text.PlainText
+                      text: "\u2715"
+                      color: chipRemoveArea.containsMouse ? root.fg : Qt.darker(root.fg, 1.9)
+                      font.family: root.fontFam
+                      font.pixelSize: Style.font.caption
+
+                      MouseArea {
+                        id: chipRemoveArea
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(3)
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.removeFavourite(modelData)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            // The editor has its own hint line; this is the same message for a
+            // switch or a removal that failed with the editor closed.
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              visible: root.locationSaveError !== "" && !root.editingLocation
+              textFormat: Text.PlainText
+              text: root.locationSaveError
+              color: root.panelColored ? root.urgentColor : root.fg
+              font.family: root.fontFam
+              font.pixelSize: Style.font.caption
+            }
+          }
+
           // ---- Location editor. Full panel width for two reasons: a geocoding
           //      label ("Toledo, Castille-La Mancha, ES") does not fit the
           //      hero's right-hand column, and this has to stay reachable
@@ -803,7 +965,7 @@ Panel {
               TextField {
                 id: locationField
                 anchors.left: parent.left
-                anchors.right: locationClear.left
+                anchors.right: locationStar.left
                 anchors.rightMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
                 foreground: root.fg
@@ -827,6 +989,29 @@ Panel {
                       Geocode.clampIndex(root.suggestionIndex - 1, root.locationSuggestions.length)
                     event.accepted = true
                   }
+                }
+              }
+
+              // Saves or unsaves whatever the field would commit.
+              Text {
+                id: locationStar
+                anchors.right: locationClear.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: Favourites.isFavourite(root.favourites, root.favouriteCandidate)
+                  ? "\u2605" : "\u2606"
+                color: locationStarArea.containsMouse ? root.fg : Qt.darker(root.fg, 1.55)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.bodySmall
+
+                MouseArea {
+                  id: locationStarArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleFavourite()
                 }
               }
 
@@ -902,8 +1087,8 @@ Panel {
               text: root.locationSaveError !== ""
                 ? "Could not save: " + root.locationSaveError
                 : (root.locationSuggestions.length > 0
-                    ? "\u2191/\u2193 pick \u00b7 Enter save \u00b7 Esc cancel"
-                    : "Enter saves what you typed \u00b7 Esc cancels")
+                    ? "\u2191/\u2193 pick \u00b7 Enter save \u00b7 Esc cancel \u00b7 \u2606 favourite"
+                    : "Enter saves what you typed \u00b7 Esc cancels \u00b7 \u2606 favourite")
               color: root.locationSaveError !== ""
                 ? (root.panelColored ? root.urgentColor : root.fg)
                 : Qt.darker(root.fg, 1.55)

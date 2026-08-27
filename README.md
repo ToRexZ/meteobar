@@ -231,7 +231,9 @@ The location line in the hero is also the editor. Click it — or press `l`
 while the panel has focus — and a field opens under the hero. Typing looks the
 city up as you go and lists the matches; `↑`/`↓` pick one, `Enter` saves it, `Esc`
 abandons the edit, and the `✕` beside the field clears the setting back to IP
-auto-detect. See [Setting the location from the panel](#setting-the-location-from-the-panel).
+auto-detect. Cities worth returning to can be kept as chips under the hero —
+see [Setting the location from the panel](#setting-the-location-from-the-panel)
+and [Favourites](#favourites).
 
 The panel shows more than the tooltip can:
 
@@ -316,6 +318,46 @@ settings change.
 With no matches on screen — geocoding unreachable, or a name it does not know —
 `Enter` still saves what you typed, so the documented `"City, CC"` form can be
 entered directly.
+
+### Favourites
+
+Cities you switch between often can be saved. Saved cities appear as a strip of
+chips under the hero, and one click on a chip switches to it — the strip is
+outside the editor for exactly that reason. The chip for the city currently in
+use is highlighted, and the strip is absent entirely until you save something.
+
+| Key or click | What it does |
+|---|---|
+| `☆` beside the field | Saves what the editor would commit — with a match highlighted, that is the resolved `"Bergen, NO"` and not the half-typed `"Berg"`. On an empty field it saves the current location |
+| `★` beside the field | The city is already saved; clicking removes it |
+| Click a chip | Switches to that city |
+| `✕` on a chip | Removes it. Only while the editor is open, so a stray click on a switcher cannot delete what it switches to |
+| `1`–`9` | Switches to that chip while the panel has focus, alongside `r` and `l` |
+
+Up to **8** cities. At the limit `☆` says so instead of quietly dropping your
+oldest one. A favourite is a shortcut and never a second notion of where the
+weather is from: switching writes the `location` setting, so the panel, the bar
+and the Waybar module cannot disagree.
+
+The list lives beside `location` in the same `shell.json` entry:
+
+```json
+{
+  "id": "mryll.meteobar",
+  "location": "Viborg, DK",
+  "favourites": ["Viborg, DK", "Aarhus, DK", "Toledo, ES"]
+}
+```
+
+It is not in the settings table below, and not in the manifest schema, because no
+settings UI has an editor for a list — the plugin control center would render it
+as a raw JSON field where a typo is dropped without a word. The panel manages it;
+hand-editing the entry above works too, and anything malformed in it is ignored
+rather than inherited.
+
+Whether a chip counts as "the current one" is exact string equality. `"Viborg,
+DK"` and `"Viborg, Central Jutland"` name the same city but are different
+settings, and guessing that they match would mean guessing which you meant.
 
 ### Settings
 
