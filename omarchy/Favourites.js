@@ -20,7 +20,16 @@ function _trim(value) {
 // nothing downstream should have to wonder what is in it: strings only, trimmed,
 // no blanks, no duplicates, never longer than the cap.
 function normalize(raw) {
-  if (!raw || Object.prototype.toString.call(raw) !== "[object Array]") return []
+  // Duck-typed, not Array.isArray(). QML does not hand JS a real Array: a
+  // `property var` holding a QVariantList arrives as a V4Sequence, where index
+  // access and .length work but Array.isArray() is false and
+  // Object.prototype.toString gives "[object V4Sequence]". Demanding a real
+  // Array threw the whole list away at runtime while every unit test passed,
+  // because node always has the real thing.
+  //
+  // `typeof raw === "object"` is what keeps a string out — it carries a length
+  // too, and would otherwise normalize into one entry per character.
+  if (!raw || typeof raw !== "object" || typeof raw.length !== "number") return []
 
   var out = []
   var seen = {}
@@ -98,4 +107,36 @@ function toggle(list, value) {
   var withValue = clean.slice()
   withValue.push(target)
   return { list: withValue, changed: true, action: "added", reason: "" }
+}
+
+// Moves the item at `from` so it lands before whatever currently sits at
+// `insertBefore` — an index into the list as it is, 0..length, where length
+// means "at the end". That is the form the drag geometry produces ("the pointer
+// is in the gap before chip 3"); the shift that applies when an item travels
+// rightward is arithmetic the caller should not have to redo.
+//
+// Returns { list, changed }, so a drag that ends where it started writes
+// nothing.
+function move(list, from, insertBefore) {
+  var clean = normalize(list)
+  var unchanged = { list: clean, changed: false }
+
+  if (from === null || from === undefined) return unchanged
+  var source = Number(from)
+  // Rejects NaN and a fractional index rather than rounding one into a
+  // neighbour's place.
+  if (!isFinite(source) || source % 1 !== 0) return unchanged
+  if (source < 0 || source >= clean.length) return unchanged
+
+  var target = Number(insertBefore)
+  if (!isFinite(target)) target = clean.length
+  target = Math.max(0, Math.min(Math.floor(target), clean.length))
+
+  // The two gaps either side of an item both mean "stay put".
+  if (target === source || target === source + 1) return unchanged
+
+  var out = clean.slice()
+  var item = out.splice(source, 1)[0]
+  out.splice(target > source ? target - 1 : target, 0, item)
+  return { list: out, changed: true }
 }

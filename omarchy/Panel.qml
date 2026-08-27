@@ -96,7 +96,13 @@ Panel {
   readonly property string locationSetting: String(setting("location", "")).trim()
   // Saved cities, in the same form as `location` — switching to one just
   // writes it there. Normalized because shell.json is hand-editable.
-  readonly property var favourites: Favourites.normalize(setting("favourites", []))
+  // Two bindings, not one: a binding whose dependency is only read inside a
+  // call into a .pragma library JS import does not get invalidated when that
+  // dependency changes, so folding the read and the normalize together left
+  // this stuck on the empty list it saw before settings were injected.
+  readonly property var favouritesRaw: setting("favourites", [])
+  readonly property var favourites: Favourites.normalize(favouritesRaw)
+
   readonly property string iconSetSetting: {
     var v = String(setting("iconSet", "nerd"))
     return ["nerd", "weather", "emoji", "fontawesome"].indexOf(v) >= 0 ? v : "nerd"
@@ -417,6 +423,66 @@ Panel {
     }
   }
 
+
+
+  // ---- Favourites: drag to reorder -----------------------------------------
+  // Mirrors the bar's own widget reorder (plugins/bar/Bar.qml), including the
+  // part that file warns about: NO drag.target. The chips are owned by a Flow
+  // positioner, and moving a positioned item's x/y leaves stale offsets that
+  // make neighbours overlap once an aborted drag snaps back. So the press is
+  // tracked by hand, a threshold separates a drag from a click, and the chips
+  // themselves never move — a marker shows where the drop lands.
+  property int dragFrom: -1
+  property int dropIndex: -1
+
+  readonly property real chipDragThreshold: Style.space(4)
+
+  // Which gap the marker is drawn in, or -1 for none. Both gaps beside the
+  // dragged chip mean "stay put", and showing a marker for a move that would
+  // change nothing reads as a promise the drop will not keep.
+  readonly property bool chipDropIsReal: dragFrom >= 0 && dropIndex >= 0
+    && dropIndex !== dragFrom && dropIndex !== dragFrom + 1
+  readonly property int chipDropBefore:
+    (chipDropIsReal && dropIndex < favourites.length) ? dropIndex : -1
+  readonly property bool chipDropAtEnd: chipDropIsReal && dropIndex >= favourites.length
+
+  // Nearest chip centre, then which side of it. That reads a wrapped row with no
+  // band arithmetic: a chip on the next line is simply further away.
+  function dropIndexAtScene(sceneX, sceneY) {
+    var p = chipFlow.mapFromItem(null, sceneX, sceneY)
+    var best = -1
+    var bestDist = Number.MAX_VALUE
+    var after = false
+
+    for (var k = 0; k < chipFlow.children.length; k++) {
+      var c = chipFlow.children[k]
+      // Skips the Repeater itself, which is a child here but has no geometry.
+      if (!c || c.chipIndex === undefined) continue
+
+      var dx = p.x - (c.x + c.width / 2)
+      var dy = p.y - (c.y + c.height / 2)
+      var d = dx * dx + dy * dy
+      if (d < bestDist) {
+        bestDist = d
+        best = c.chipIndex
+        after = dx > 0
+      }
+    }
+    if (best < 0) return -1
+    return after ? best + 1 : best
+  }
+
+  function clearChipDrag() {
+    dragFrom = -1
+    dropIndex = -1
+  }
+
+  function dropChip() {
+    var result = Favourites.move(favourites, dragFrom, dropIndex)
+    clearChipDrag()
+    if (!result.changed) return
+    persistFavourites(result.list)
+  }
 
   // ---- Favourites ----------------------------------------------------------
   // A favourite is a shortcut and not a second notion of "where": switching
@@ -860,6 +926,7 @@ Panel {
               || (root.locationSaveError !== "" && !root.editingLocation)
 
             Flow {
+              id: chipFlow
               width: parent.width
               spacing: Style.space(6)
 
@@ -867,10 +934,16 @@ Panel {
                 model: root.favourites
 
                 delegate: Rectangle {
+                  id: chip
                   required property var modelData
                   required property int index
 
+                  // Read back off chipFlow.children when locating a drop.
+                  readonly property int chipIndex: index
                   readonly property bool isCurrent: String(modelData) === root.locationSetting
+
+                  // The chip stays put while dragged; only its weight changes.
+                  opacity: root.dragFrom === index ? 0.45 : 1
 
                   width: chipRow.implicitWidth + Style.space(14)
                   height: chipRow.implicitHeight + Style.space(7)
@@ -882,14 +955,89 @@ Panel {
                   border.width: 1
                   border.color: isCurrent ? Qt.darker(root.fg, 1.4) : Qt.darker(root.fg, 2.3)
 
+                  // Drop marker on this chip's leading edge, and on the
+                  // trailing edge of the last chip when the drop is at the
+                  // end. Children of the chip on purpose: anything parented
+                  // to the Flow gets positioned by it instead of placed.
+                  Rectangle {
+                    visible: root.chipDropBefore === chip.chipIndex
+                    x: -Style.space(4)
+                    width: Style.space(2)
+                    height: parent.height
+                    radius: width / 2
+                    color: Color.accent
+                    z: 6
+                  }
+
+                  Rectangle {
+                    visible: root.chipDropAtEnd
+                      && chip.chipIndex === root.favourites.length - 1
+                    x: parent.width + Style.space(2)
+                    width: Style.space(2)
+                    height: parent.height
+                    radius: width / 2
+                    color: Color.accent
+                    z: 6
+                  }
+
                   // Declared before the row so the row's own remove target,
                   // being the later sibling, takes its clicks first.
                   MouseArea {
                     id: chipArea
                     anchors.fill: parent
                     hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.switchToFavourite(modelData)
+                    acceptedButtons: Qt.LeftButton
+                    cursorShape: root.dragFrom === chip.chipIndex
+                      ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+
+                    property real pressX: 0
+                    property real pressY: 0
+                    // A completed drag must not also switch city: onClicked
+                    // still fires after the release that ended the drag.
+                    property bool suppressClick: false
+
+                    onPressed: function(mouse) {
+                      pressX = mouse.x
+                      pressY = mouse.y
+                      suppressClick = false
+                      root.clearChipDrag()
+                    }
+
+                    onPositionChanged: function(mouse) {
+                      if (!(mouse.buttons & Qt.LeftButton)) return
+                      // One chip has nowhere to go.
+                      if (root.favourites.length < 2) return
+
+                      if (root.dragFrom < 0) {
+                        var travelled = Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY)
+                        if (travelled < root.chipDragThreshold) return
+                        root.dragFrom = chip.chipIndex
+                      }
+
+                      var scene = chipArea.mapToItem(null, mouse.x, mouse.y)
+                      root.dropIndex = root.dropIndexAtScene(scene.x, scene.y)
+                    }
+
+                    onReleased: function(mouse) {
+                      if (root.dragFrom < 0) return
+                      suppressClick = true
+                      root.dropChip()
+                    }
+
+                    // Pointer grab lost — the panel closing under the drag,
+                    // for one. Abandon it rather than committing a guess.
+                    onCanceled: {
+                      suppressClick = root.dragFrom >= 0
+                      root.clearChipDrag()
+                    }
+
+                    onClicked: {
+                      if (suppressClick) {
+                        suppressClick = false
+                        return
+                      }
+                      root.switchToFavourite(modelData)
+                    }
                   }
 
                   Row {

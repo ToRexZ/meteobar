@@ -14,7 +14,7 @@ const source = readFileSync(join(here, "Favourites.js"), "utf8")
 const F = new Function(
   source +
     "\nreturn { CAPACITY: CAPACITY, normalize: normalize, chipLabel: chipLabel," +
-    " isFavourite: isFavourite, toggle: toggle }"
+    " isFavourite: isFavourite, toggle: toggle, move: move }"
 )()
 
 test("CAPACITY is the documented limit", () => {
@@ -138,4 +138,93 @@ test("toggle normalizes a hand-edited list on the way through", () => {
 test("toggle trims the value it stores", () => {
   const out = F.toggle([], "  Toledo, ES  ")
   assert.deepEqual(out.list, ["Toledo, ES"])
+})
+
+// ---- move --------------------------------------------------------------
+// `insertBefore` is an index into the list AS IT IS, 0..length, because that is
+// what the drag geometry produces: "the pointer is in the gap before chip 3".
+// Everything past that — the shift when an item moves rightward — is arithmetic
+// the caller should not have to get right.
+
+const ABCD = ["A", "B", "C", "D"]
+
+test("move drags an item rightward, before a later chip", () => {
+  const out = F.move(ABCD, 0, 2)
+  assert.deepEqual(out.list, ["B", "A", "C", "D"])
+  assert.equal(out.changed, true)
+})
+
+test("move drags an item to the very end", () => {
+  assert.deepEqual(F.move(ABCD, 0, 4).list, ["B", "C", "D", "A"])
+})
+
+test("move drags an item leftward", () => {
+  assert.deepEqual(F.move(ABCD, 3, 0).list, ["D", "A", "B", "C"])
+  assert.deepEqual(F.move(ABCD, 2, 1).list, ["A", "C", "B", "D"])
+})
+
+test("move reports no change when the item lands where it already is", () => {
+  // Both gaps adjacent to an item mean "stay put": before itself, and before
+  // its right-hand neighbour.
+  for (const before of [1, 2]) {
+    const out = F.move(ABCD, 1, before)
+    assert.deepEqual(out.list, ABCD, `insertBefore: ${before}`)
+    assert.equal(out.changed, false, `insertBefore: ${before}`)
+  }
+})
+
+test("move clamps an insertion point past the end", () => {
+  assert.deepEqual(F.move(ABCD, 0, 99).list, ["B", "C", "D", "A"])
+})
+
+test("move clamps a negative insertion point", () => {
+  assert.deepEqual(F.move(ABCD, 2, -5).list, ["C", "A", "B", "D"])
+})
+
+test("move refuses an out-of-range source", () => {
+  for (const from of [-1, 4, 99, "x", null, undefined, 1.5]) {
+    const out = F.move(ABCD, from, 0)
+    assert.deepEqual(out.list, ABCD, `from: ${String(from)}`)
+    assert.equal(out.changed, false, `from: ${String(from)}`)
+  }
+})
+
+test("move does not mutate the list it was given", () => {
+  const before = ["A", "B", "C"]
+  F.move(before, 0, 3)
+  assert.deepEqual(before, ["A", "B", "C"])
+})
+
+test("move normalizes a hand-edited list on the way through", () => {
+  const out = F.move(["  A  ", "", "B", "A", "C"], 0, 3)
+  assert.deepEqual(out.list, ["B", "C", "A"])
+})
+
+test("move is a no-op on a list too short to reorder", () => {
+  assert.equal(F.move(["A"], 0, 1).changed, false)
+  assert.equal(F.move([], 0, 0).changed, false)
+})
+
+test("normalize accepts an array-like that is not a real Array", () => {
+  // QML does not hand JS a real Array. A `property var` holding a QVariantList
+  // arrives as a V4Sequence: length and index access work, but
+  // Array.isArray() is false and Object.prototype.toString gives
+  // "[object V4Sequence]". Demanding a real Array silently emptied the list at
+  // runtime while every test here passed, because node always has the real
+  // thing. Duck-typing the container is the whole fix.
+  const sequenceLike = { 0: "Aarhus, DK", 1: "Aalborg, DK", length: 2 }
+  assert.equal(Array.isArray(sequenceLike), false)
+  assert.deepEqual(F.normalize(sequenceLike), ["Aarhus, DK", "Aalborg, DK"])
+})
+
+test("normalize still rejects a string, which is also length-bearing", () => {
+  // The duck-type must not treat "Viborg, DK" as ten single-character entries.
+  assert.deepEqual(F.normalize("Viborg, DK"), [])
+})
+
+test("move and toggle work on an array-like too", () => {
+  const sequenceLike = { 0: "A", 1: "B", 2: "C", length: 3 }
+  assert.deepEqual(F.move(sequenceLike, 0, 3).list, ["B", "C", "A"])
+  assert.deepEqual(F.toggle(sequenceLike, "D").list, ["A", "B", "C", "D"])
+  assert.equal(F.isFavourite(sequenceLike, "B"), true)
 })
