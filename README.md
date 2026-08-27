@@ -240,6 +240,11 @@ The panel shows more than the tooltip can:
 - A hero block with a large glyph, the temperature, the apparent temperature, and the resolved location
 - An hourly strip that tints each temperature by its position between the coldest and the warmest hour in view
 - A daily section where each day is a min-max bar on the range of the whole week
+- A compass where the wind letters used to be. The needle points where the wind
+  is **going**, which is the half turn away from the direction Open-Meteo
+  reports; hovering it names the direction the wind comes **from**, with the
+  exact bearing. The Waybar `{wind_dir}` placeholder is unchanged and still
+  prints letters.
 
 Both frontends read the same forecast. The core selects the entries one time, so "the next 12 hours" means the same thing in the panel and in the tooltip. A night hour also gets its night icon in both frontends.
 

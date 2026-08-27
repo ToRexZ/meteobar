@@ -5,6 +5,7 @@ import qs.Commons
 import qs.Ui
 import "Geocode.js" as Geocode
 import "Favourites.js" as Favourites
+import "Wind.js" as Wind
 
 // Forecast panel. Owns the meteobar process and the refresh timer, so the bar
 // label stays current even while the panel is closed. All data comes from
@@ -65,6 +66,25 @@ Panel {
   readonly property var dailyEntries: (report && report.daily) ? report.daily : []
   readonly property string locationName: (report && report.location) ? String(report.location) : ""
   readonly property string tempUnit: (report && report.units && report.units.temperature) ? report.units.temperature : "°C"
+  // Where the wind is going, for the compass needle — null when there is no
+  // reading, which hides the compass instead of aiming it at north. The
+  // tooltip still names the direction the wind comes FROM, which is what the
+  // reported number means and what the letters used to say.
+  readonly property var windBearing: current
+    ? Wind.downwindBearing(current.wind_direction_deg) : null
+
+  readonly property string windTooltip: {
+    if (!current) return ""
+    var name = current.wind_direction ? String(current.wind_direction) : ""
+    var deg = current.wind_direction_deg
+    var degText = (deg === null || deg === undefined || !isFinite(Number(deg)))
+      ? "" : Math.round(Number(deg)) + "\u00b0"
+    if (name !== "" && degText !== "") return "From " + name + " \u00b7 " + degText
+    if (name !== "") return "From " + name
+    if (degText !== "") return "From " + degText
+    return ""
+  }
+
   readonly property string windUnit: (report && report.units && report.units.wind_speed) ? report.units.wind_speed : "km/h"
   readonly property var cacheInfo: (report && report.cache) ? report.cache : null
   readonly property string updatedText: (cacheInfo && cacheInfo.fetched_at) ? String(cacheInfo.fetched_at).slice(11, 16) : ""
@@ -879,15 +899,125 @@ Panel {
                     font.pixelSize: Style.font.bodySmall
                     font.letterSpacing: 1
                   }
-                  Text {
-                    textFormat: Text.PlainText
-                    text: (root.current && root.current.wind_speed !== null && root.current.wind_speed !== undefined)
-                      ? Math.round(root.current.wind_speed) + " " + root.windUnit
-                        + (root.current.wind_direction ? " " + root.current.wind_direction : "")
-                      : "—"
-                    color: root.fg
-                    font.family: root.fontFam
-                    font.pixelSize: Style.font.title
+                  Row {
+                    spacing: Style.space(7)
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: (root.current && root.current.wind_speed !== null && root.current.wind_speed !== undefined)
+                        ? Math.round(root.current.wind_speed) + " " + root.windUnit
+                        : "—"
+                      color: root.fg
+                      font.family: root.fontFam
+                      font.pixelSize: Style.font.title
+                    }
+
+                    // ---- Compass. A ring with four ticks and a needle turned
+                    //      to the bearing, built from Rectangles on purpose:
+                    //      a set of eight arrow glyphs would quantise the angle
+                    //      into 45° buckets, and a single rotated glyph sits
+                    //      visibly off-centre because glyph ink is not centred
+                    //      in the em box. Rectangles also re-theme straight from
+                    //      bindings, where a Canvas would need a requestPaint()
+                    //      on every bearing and every theme change.
+                    Item {
+                      id: windCompass
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: root.windBearing !== null
+                      implicitWidth: size
+                      implicitHeight: size
+                      width: size
+                      height: size
+
+                      readonly property real size: Math.round(Style.font.title * 1.2)
+                      readonly property color ringColor: Qt.darker(root.fg, 2.1)
+                      readonly property color tickColor: Qt.darker(root.fg, 1.8)
+                      readonly property color needleColor: root.panelColored ? Color.accent : root.fg
+                      readonly property color tailColor: Qt.darker(root.fg, 1.9)
+
+                      Rectangle {
+                        anchors.fill: parent
+                        radius: width / 2
+                        color: "transparent"
+                        border.width: 1
+                        border.color: windCompass.ringColor
+                      }
+
+                      // Four ticks. Each delegate fills the dial and rotates
+                      // about its own centre — which is the dial's centre — so
+                      // a mark pinned to the top swings round to E, S and W.
+                      // Rotating the marks themselves would spin them in place.
+                      Repeater {
+                        model: 4
+
+                        delegate: Item {
+                          required property int index
+                          anchors.fill: parent
+                          rotation: index * 90
+
+                          Rectangle {
+                            width: 1
+                            height: Math.max(2, Math.round(windCompass.size * 0.14))
+                            color: windCompass.tickColor
+                            x: (parent.width - width) / 2
+                            y: 1
+                          }
+                        }
+                      }
+
+                      // The needle, same trick. At rotation 0 it points up, and
+                      // QML rotation is clockwise, so the angle IS the bearing.
+                      Item {
+                        anchors.fill: parent
+                        rotation: root.windBearing === null ? 0 : root.windBearing
+
+                        // Pointing end: longer, brighter, reaching the rim.
+                        Rectangle {
+                          width: Math.max(1, Math.round(windCompass.size * 0.11))
+                          height: Math.round(windCompass.size * 0.40)
+                          radius: width / 2
+                          color: windCompass.needleColor
+                          x: (parent.width - width) / 2
+                          y: Math.round(windCompass.size * 0.10)
+                        }
+
+                        // Tail: shorter and dimmer. The asymmetry is what makes
+                        // the needle read as pointing, with no arrowhead to
+                        // draw and no glyph to centre.
+                        Rectangle {
+                          width: Math.max(1, Math.round(windCompass.size * 0.08))
+                          height: Math.round(windCompass.size * 0.24)
+                          radius: width / 2
+                          color: windCompass.tailColor
+                          x: (parent.width - width) / 2
+                          y: Math.round(windCompass.size * 0.52)
+                        }
+                      }
+
+                      Rectangle {
+                        width: Math.max(2, Math.round(windCompass.size * 0.14))
+                        height: width
+                        radius: width / 2
+                        color: windCompass.needleColor
+                        anchors.centerIn: parent
+                      }
+
+                      // The letters are gone from the cell, so the reported
+                      // direction and the exact bearing live here.
+                      MouseArea {
+                        id: windCompassArea
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(3)
+                        hoverEnabled: true
+
+                        PanelToolTip {
+                          visible: windCompassArea.containsMouse && root.windTooltip !== ""
+                          text: root.windTooltip
+                          fontFamily: root.fontFam
+                        }
+                      }
+                    }
                   }
                 }
 
