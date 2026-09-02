@@ -7,6 +7,26 @@ use fs2::FileExt;
 
 const MIN_TTL_SECS: u64 = 60;
 
+/// How long a run that finds the lock taken waits for the holder before it
+/// gives up and serves what is on disk. Bounded on purpose — see
+/// `fetch_or_cached` — and generous enough to cover an ordinary fetch, which
+/// is all the holder is doing.
+const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(2);
+
+/// How often the wait re-checks. Short enough that the extra runs finish
+/// within a frame or two of the winner, long enough not to spin.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How a wait for the fetch lock ended.
+enum LockWait {
+    /// The lock is ours; go fetch.
+    Acquired,
+    /// The holder landed a fresh payload while we waited. Nothing left to do.
+    CacheTurnedFresh(String),
+    /// Nobody let go within the budget.
+    TimedOut,
+}
+
 /// Open a file for writing, refusing anything that is not a regular file.
 ///
 /// `open(2)` blocks on a FIFO in BOTH directions: `O_WRONLY` waits for a
@@ -164,17 +184,25 @@ impl Cache {
     }
 
     /// Run a fetch function with file-lock serialization and caching.
-    /// Only one process fetches a given request at a time; a second one does
-    /// NOT wait for it — it serves what is already cached. Returns the payload
-    /// plus its freshness metadata.
+    /// Only one process fetches a given request at a time; the others wait
+    /// briefly for it rather than fetching the same payload again. Returns the
+    /// payload plus its freshness metadata.
     ///
-    /// The wait is what had to go. `lock_exclusive` has no timeout, so one
-    /// process that holds this lock — wedged mid-fetch, stopped under a
-    /// debugger, or simply planted there — stops every later run for ever,
-    /// and this widget runs inside the long-lived omarchy-shell process.
-    /// Refusing to wait costs nothing: whoever holds the lock is fetching the
-    /// same payload, and serving cache without fetching is a path this already
-    /// had for the case where the cache is fresh.
+    /// Contention here is the ordinary case, not a fault: the Omarchy shell
+    /// builds one bar per monitor, so every refresh fires one run per screen at
+    /// once, all of them wanting the single payload the winner is already
+    /// fetching. Those runs wait, and the wait ends on whichever comes first —
+    /// the lock coming free, or the cache turning fresh. It is usually the
+    /// second, because the winner renames its payload into place before it
+    /// unlocks.
+    ///
+    /// The wait is BOUNDED, and that bound is the whole point. `lock_exclusive`
+    /// has no timeout, so one process that holds this lock — wedged mid-fetch,
+    /// stopped under a debugger, or simply planted there — would stop every
+    /// later run for ever, and this widget runs inside the long-lived
+    /// omarchy-shell process. Once the budget is spent this falls back to the
+    /// old degraded answer: serve the cache, flagged `lock_busy`, and never
+    /// block again.
     pub fn fetch_or_cached<F>(&self, fetch_fn: F) -> Result<(String, Freshness), String>
     where
         F: FnOnce() -> Result<String, String>,
@@ -183,17 +211,44 @@ impl Cache {
         let lock_file =
             open_regular_write(&lock_path, false).map_err(|e| format!("lock open failed: {e}"))?;
 
-        // Any error means "not ours to take" and takes the same degraded path:
-        // contention, and anything else the platform reports, are equally
-        // reasons not to fetch and not to block.
-        if lock_file.try_lock_exclusive().is_err() {
-            return self.serve_cached_without_fetching();
+        match self.wait_for_lock(&lock_file) {
+            LockWait::Acquired => {
+                let result = self.fetch_inner(fetch_fn);
+                lock_file.unlock().ok();
+                result
+            }
+            LockWait::CacheTurnedFresh(data) => Ok((
+                data,
+                Freshness {
+                    fetched_at: self.last_fetched(),
+                    stale: false,
+                    stale_reason: None,
+                },
+            )),
+            LockWait::TimedOut => self.serve_cached_without_fetching(),
         }
+    }
 
-        let result = self.fetch_inner(fetch_fn);
-
-        lock_file.unlock().ok();
-        result
+    /// Wait for the fetch lock, or for someone else's fetch to make waiting
+    /// pointless. The first attempt happens before any sleep, so the
+    /// uncontended path is exactly as fast as it was.
+    ///
+    /// Any lock error other than contention lands in the same place: it is not
+    /// ours to take, so it is not ours to fetch under.
+    fn wait_for_lock(&self, lock_file: &fs::File) -> LockWait {
+        let deadline = std::time::Instant::now() + LOCK_WAIT_BUDGET;
+        loop {
+            if lock_file.try_lock_exclusive().is_ok() {
+                return LockWait::Acquired;
+            }
+            if let Some(fresh) = self.read_fresh() {
+                return LockWait::CacheTurnedFresh(fresh);
+            }
+            if std::time::Instant::now() >= deadline {
+                return LockWait::TimedOut;
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL);
+        }
     }
 
     /// Another instance holds the lock: return what is on disk, never fetch.
@@ -391,9 +446,11 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The lock is only worth taking if not taking it is survivable. Waiting on
-    /// it is not: this runs inside omarchy-shell, and one holder that never
-    /// lets go used to stop every later run for ever.
+    /// A holder that never lets go. Waiting for the lock is worth it only
+    /// while the wait has an end: this runs inside omarchy-shell, and an
+    /// unbounded wait on a wedged holder used to stop every later run for
+    /// ever. Past the budget the answer degrades to the cache, flagged
+    /// `lock_busy`, and no run blocks again.
     ///
     /// The holder here is a second descriptor, not a second process, and that
     /// is the same conflict: `flock(2)` owns the lock per open file
@@ -404,7 +461,7 @@ mod tests {
     /// a regression fails this test in seconds instead of hanging the suite.
     #[cfg(unix)]
     #[test]
-    fn a_lock_held_by_someone_else_serves_cache_instead_of_waiting() {
+    fn a_lock_nobody_lets_go_of_serves_cache_within_a_bounded_wait() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
 
@@ -442,9 +499,15 @@ mod tests {
             tx.send(out).ok();
         });
 
+        let started = std::time::Instant::now();
         let got = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(LOCK_WAIT_BUDGET + Duration::from_secs(5))
             .expect("fetch_or_cached blocked on a lock held by someone else");
+        let waited = started.elapsed();
+        assert!(
+            waited < LOCK_WAIT_BUDGET + Duration::from_secs(2),
+            "the wait must be bounded by the budget, took {waited:?}"
+        );
         let (data, freshness) = got.unwrap();
         assert_eq!(data, "payload-1");
         assert!(freshness.stale);
@@ -455,6 +518,94 @@ mod tests {
         );
 
         FileExt::unlock(&holder).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Push a cache file's mtime into the past, so `read_fresh` sees it as
+    /// expired against a real TTL. A zero TTL expires everything including the
+    /// payload a test just wrote, which is the one thing these cases must be
+    /// able to tell apart.
+    #[cfg(unix)]
+    fn backdate(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+        let epoch = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timeval {
+                tv_sec: epoch,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: epoch,
+                tv_usec: 0,
+            },
+        ];
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) }, 0);
+    }
+
+    /// The three-monitor case. One bar's run takes the lock and fetches; the
+    /// others arrive while it is held, and the cache is expired — that is why
+    /// all of them are here at once. Waiting briefly costs nothing, because the
+    /// holder is fetching the very payload these runs want, and it is the
+    /// difference between every extra monitor wearing a stale mark on every
+    /// refresh and all of them showing one fresh reading.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_released_mid_wait_serves_the_winners_fresh_payload() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let dir = temp_dir("lock-released");
+        let key = test_key("auto", "metric", 3, 0);
+        // A real TTL with a cache backdated past it: the exact state every run
+        // is in when the refresh timer fires.
+        let cache = Cache::with_dir(dir.clone(), &key, Duration::from_secs(60));
+        cache.fetch_or_cached(|| Ok("payload-1".into())).unwrap();
+        backdate(&dir.join(format!("weather-{}.json", key.digest())), 600);
+
+        let lock_path = dir.join(format!(".weather-{}.json.lock", key.digest()));
+        let holder = open_regular_write(&lock_path, false).unwrap();
+        holder.lock_exclusive().unwrap();
+
+        static FETCHED: AtomicBool = AtomicBool::new(false);
+        FETCHED.store(false, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        let thread_dir = dir.clone();
+        std::thread::spawn(move || {
+            let cache = Cache::with_dir(
+                thread_dir,
+                &test_key("auto", "metric", 3, 0),
+                Duration::from_secs(60),
+            );
+            let out = cache.fetch_or_cached(|| {
+                FETCHED.store(true, Ordering::SeqCst);
+                Ok("payload-waiter".into())
+            });
+            tx.send(out).ok();
+        });
+
+        // The holder finishes its fetch and lets go, the way a winning run does.
+        std::thread::sleep(Duration::from_millis(150));
+        cache.write("payload-2");
+        FileExt::unlock(&holder).ok();
+
+        let (data, freshness) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the waiting run never returned")
+            .unwrap();
+        assert_eq!(
+            data, "payload-2",
+            "a run that waited must serve the winner's payload"
+        );
+        assert!(!freshness.stale, "the winner's payload is not stale");
+        assert_eq!(freshness.stale_reason, None);
+        assert!(
+            !FETCHED.load(Ordering::SeqCst),
+            "the waiter must not re-fetch a payload the winner already got"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
